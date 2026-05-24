@@ -1,117 +1,138 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-# -----------------------------
-# Basic blocks
-# -----------------------------
-class MLP(nn.Module):
-    def __init__(self, in_dim, out_dim):
+
+class Encoder(nn.Module):
+
+    def __init__(
+        self,
+        hidden_dim=128,
+        num_layers=3,
+        num_heads=8
+    ):
+
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, out_dim),
-            nn.ReLU(),
-            nn.Linear(out_dim, out_dim)
+
+        # =====================================
+        # sequence embedding
+        # =====================================
+
+        self.seq_embedding = nn.Embedding(
+            21,
+            hidden_dim
         )
 
-    def forward(self, x):
-        return self.net(x)
+        # =====================================
+        # peptide feature projection
+        # input:
+        # backbone(2) + sidechain(4)
+        # =====================================
 
+        self.pep_proj = nn.Linear(
+            6,
+            hidden_dim
+        )
 
-class SelfAttentionBlock(nn.Module):
-    def __init__(self, d):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(d, num_heads=4, batch_first=True)
-        self.ffn = MLP(d, d)
-        self.norm1 = nn.LayerNorm(d)
-        self.norm2 = nn.LayerNorm(d)
+        # =====================================
+        # receptor projection
+        # xyz coords -> hidden
+        # =====================================
 
-    def forward(self, x):
-        h, _ = self.attn(x, x, x)
-        x = self.norm1(x + h)
-        x = self.norm2(x + self.ffn(x))
-        return x
+        self.rec_proj = nn.Linear(
+            3,
+            hidden_dim
+        )
 
+        # =====================================
+        # peptide encoder
+        # =====================================
 
-# -----------------------------
-# Distance-aware Cross Attention
-# -----------------------------
-class CrossAttention(nn.Module):
-    def __init__(self, d):
-        super().__init__()
-        self.q = nn.Linear(d, d)
-        self.k = nn.Linear(d, d)
-        self.v = nn.Linear(d, d)
+        pep_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            batch_first=True
+        )
 
-    def forward(self, h_pep, h_rec, distance_map):
+        self.pep_encoder = nn.TransformerEncoder(
+            pep_layer,
+            num_layers=num_layers
+        )
 
-        Q = self.q(h_pep)             # (L, d)
-        K = self.k(h_rec)             # (N, d)
-        V = self.v(h_rec)             # (N, d)
+        # =====================================
+        # receptor encoder
+        # =====================================
 
-        attn_logits = Q @ K.transpose(0, 1) / (Q.shape[-1] ** 0.5)
+        rec_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            batch_first=True
+        )
 
-        # distance bias
-        distance_bias = -distance_map / 5.0
-        attn_logits = attn_logits + distance_bias
-
-        attn = torch.softmax(attn_logits, dim=-1)
-
-        context = attn @ V
-
-        return h_pep + context
-
-
-# -----------------------------
-# Full Encoder
-# -----------------------------
-class Encoder(nn.Module):
-    def __init__(self, d=128):
-
-        super().__init__()
-
-        # embeddings
-        self.seq_embed = nn.Embedding(20, d)
-        self.atom_embed = nn.Embedding(4, d)
-
-        self.coord_embed = MLP(3, d)
-        self.torsion_embed = MLP(12, d)
-
-        # encoders
-        self.pep_encoder = SelfAttentionBlock(d)
-        self.rec_encoder = SelfAttentionBlock(d)
-
-        self.cross_attn = CrossAttention(d)
+        self.rec_encoder = nn.TransformerEncoder(
+            rec_layer,
+            num_layers=num_layers
+        )
 
     def forward(self, batch):
 
-        # unpack
-        peptide_coords = batch["peptide_coords"]
-        receptor_coords = batch["receptor_coords"]
-        seq_ids = batch["seq_ids"]
-        torsions = batch["torsions"]
-        atom_types = batch["receptor_types"]
+        # =====================================
+        # peptide inputs
+        # =====================================
 
+        peptide_seq = batch["peptide_seq"]
+
+        pep_features = batch["pep_features"]
+
+        peptide_mask = batch["peptide_mask"]
+
+        # =====================================
+        # receptor inputs
+        # =====================================
+
+        receptor_coords = batch["rec_features"]
+
+        # =====================================
         # embeddings
-        h_pep = (
-            self.seq_embed(seq_ids) +
-            self.coord_embed(peptide_coords) +
-            self.torsion_embed(torsions)
+        # =====================================
+
+        seq_embed = self.seq_embedding(
+            peptide_seq
         )
 
-        h_rec = (
-            self.atom_embed(atom_types) +
-            self.coord_embed(receptor_coords)
+        feat_embed = self.pep_proj(
+            pep_features
         )
 
-        # self encoding
-        h_pep = self.pep_encoder(h_pep)
-        h_rec = self.rec_encoder(h_rec)
+        h_pep = seq_embed + feat_embed
 
-        # compute distance map ON-THE-FLY
-        D = torch.cdist(peptide_coords, receptor_coords)
+        h_rec = self.rec_proj(
+            receptor_coords
+        )
 
-        # cross attention
-        h_pep = self.cross_attn(h_pep, h_rec, D)
+        # =====================================
+        # masks
+        # =====================================
+
+        pep_padding_mask = (
+            peptide_mask == 0
+        )
+
+        rec_padding_mask = (
+            receptor_coords.abs().sum(dim=-1) == 0
+        )
+
+        # =====================================
+        # transformer encoding
+        # =====================================
+
+        h_pep = self.pep_encoder(
+            h_pep,
+            src_key_padding_mask=pep_padding_mask
+        )
+
+        h_rec = self.rec_encoder(
+            h_rec,
+            src_key_padding_mask=rec_padding_mask
+        )
 
         return h_pep, h_rec

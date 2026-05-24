@@ -22,6 +22,13 @@ AA_TO_ID = {
     'X':20
 }
 
+AA_MAP_3TO1 = {
+    'ALA':'A','ARG':'R','ASN':'N','ASP':'D','CYS':'C',
+    'GLN':'Q','GLU':'E','GLY':'G','HIS':'H','ILE':'I',
+    'LEU':'L','LYS':'K','MET':'M','PHE':'F','PRO':'P',
+    'SER':'S','THR':'T','TRP':'W','TYR':'Y','VAL':'V'
+}
+
 
 # ======================================
 # Dataset
@@ -44,13 +51,19 @@ class PeptideDataset(Dataset):
 
     def encode_sequence(self, seq):
 
-        ids = [
-            AA_TO_ID.get(s, 20)
-            for s in seq
-        ]
+        ids = []
+        for s in seq:
+            # handle 3-letter codes
+            s_one = AA_MAP_3TO1.get(s, s)
+            
+            # if still more than 1 char, it is unknown
+            if len(s_one) > 1:
+                s_one = 'X'
+                
+            ids.append(AA_TO_ID.get(s_one, 20))
 
         return torch.tensor(ids, dtype=torch.long)
-
+    
 
     def __getitem__(self, idx):
 
@@ -63,7 +76,7 @@ class PeptideDataset(Dataset):
         # peptide sequence
         # ==========================
 
-        peptide_seq = str(data["peptide_seq"])
+        peptide_seq = data["peptide_seq"]
 
         peptide_seq_ids = self.encode_sequence(
             peptide_seq
@@ -90,22 +103,34 @@ class PeptideDataset(Dataset):
         backbone = torch.tensor(
             data["backbone_torsions"],
             dtype=torch.float32
-        )
+        )   # (L, 2)
 
         sidechain = torch.tensor(
             data["sidechain_torsions"],
             dtype=torch.float32
-        )
+        )   # (L, 4)
 
-        # combine peptide features
+        # ==========================
+        # peptide mask
+        # ==========================
+
+        peptide_mask = torch.tensor(
+            data["peptide_mask"],
+            dtype=torch.float32
+        )   # (L,)
+
+        # ==========================
+        # peptide features
+        # ==========================
+
+        # residue-level features
         peptide_features = torch.cat(
             [
-                peptide_coords,
                 backbone,
                 sidechain
             ],
             dim=-1
-        )
+        )   # (L, 6)
 
         # ==========================
         # receptor types
@@ -117,19 +142,20 @@ class PeptideDataset(Dataset):
         )
 
         # ==========================
-        # peptide mask
+        # create residue coordinates
         # ==========================
 
-        peptide_mask = torch.tensor(
-            data["peptide_mask"],
-            dtype=torch.float32
-        )
+        # peptide_coords is atom-level
+        # need residue-level coordinates
+
+        L = backbone.shape[0]
+
+        peptide_coords = peptide_coords[:L]
 
         # ==========================
         # dummy targets
         # ==========================
 
-        # create contact map from distance
         dist_map = torch.cdist(
             peptide_coords,
             receptor_coords
@@ -144,6 +170,8 @@ class PeptideDataset(Dataset):
             "peptide_seq": peptide_seq_ids,
 
             "pep_features": peptide_features,
+
+            "pep_coords": peptide_coords,
 
             "rec_features": receptor_coords,
 
@@ -165,6 +193,11 @@ def collate_fn(batch):
 
     pep_feat = [
         x["pep_features"]
+        for x in batch
+    ]
+
+    pep_coords = [
+        x["pep_coords"]
         for x in batch
     ]
 
@@ -199,6 +232,11 @@ def collate_fn(batch):
 
     pep_feat = pad_sequence(
         pep_feat,
+        batch_first=True
+    )
+
+    pep_coords = pad_sequence(
+        pep_coords,
         batch_first=True
     )
 
@@ -251,6 +289,8 @@ def collate_fn(batch):
 
         "pep_features": pep_feat,
 
+        "pep_coords": pep_coords,
+
         "rec_features": rec_feat,
 
         "contact_mask": torch.stack(
@@ -269,10 +309,12 @@ def collate_fn(batch):
 # Device
 # ======================================
 
-device = torch.device(
-    "cuda" if torch.cuda.is_available()
-    else "cpu"
-)
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+elif torch.cuda.is_available():
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
 
 print("Using:", device)
 
@@ -363,4 +405,9 @@ for epoch in range(50):
     print(
         f"Epoch {epoch+1} "
         f"Loss: {total_loss/len(dataloader):.4f}"
+    )
+
+    torch.save(
+        encoder.state_dict(),
+        "encoder_model.pth"
     )
